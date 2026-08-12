@@ -1,0 +1,38 @@
+{
+  "project_name": "XX至YY 500kV输电工程",
+  "voltage_kv": 500,
+  "ice_zone": 10,
+  "wind_zone": "B",
+  "working_crs": "auto",
+  "data_availability": {
+    "river_polygon": true,
+    "wind_ice_zone_raster": false
+  },
+  "river_rule": {
+    "major_river_threshold_m": 900,
+    "conservative_wide_river_names": []
+  },
+  "allow_planar_2d_mode": true,
+  "enable_airport_legacy_processing": false,
+  "enable_building_cluster_legacy": false,
+  "enable_corridor_legacy": false,
+  "solver_params": {
+    "fine_resolution_m": 25,
+    "coarse_resolution_m": 100
+  },
+  "start_point": [
+   
+  ],
+  "end_point": [
+   
+  ],
+  "source_crs": "EPSG:4547",
+  "_subset_metadata": {
+    "bbox": [
+      
+    ],
+    "bbox_crs": "EPSG:4547",
+    "source": "",
+    "generated_by": ""
+  }
+}

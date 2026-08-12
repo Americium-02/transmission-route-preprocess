@@ -1,0 +1,9 @@
+{
+  "description": "风区×覆冰区组合代价表",
+  "combinations": [
+    {"zone_code":1,"wind_zone":"A","ice_zone":0,"tower_cost_multiplier":1.0,"line_cost_multiplier":1.0,"max_turn_angle_deg":90,"path_cost_adder":0},
+    {"zone_code":2,"wind_zone":"B","ice_zone":10,"tower_cost_multiplier":1.15,"line_cost_multiplier":1.10,"max_turn_angle_deg":90,"path_cost_adder":50},
+    {"zone_code":3,"wind_zone":"C","ice_zone":20,"tower_cost_multiplier":1.40,"line_cost_multiplier":1.25,"max_turn_angle_deg":45,"path_cost_adder":200},
+    {"zone_code":4,"wind_zone":"D","ice_zone":30,"tower_cost_multiplier":1.65,"line_cost_multiplier":1.40,"max_turn_angle_deg":45,"path_cost_adder":500}
+  ]
+}

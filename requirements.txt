@@ -1,0 +1,14 @@
+# preprocess 包依赖
+# 说明: 版本号以 v5.7 原项目为基准, 不限死以便兼容用户本地环境。
+# 如需严格锁定, 可用 `pip freeze > requirements.lock.txt` 生成锁文件。
+
+# --- 必需 ---
+numpy>=1.22
+pandas>=1.4
+shapely>=2.0           # M2 严格几何判定 / 平行关系分析
+geopandas>=0.13        # 矢量 I/O, CRS 转换
+rasterio>=1.3          # 栅格读写 + warp.reproject (支持 max/min/med 聚合型重采样,
+                       # 这是 v0.3 resample_to_workspace 的底层, 必须 >=1.3)
+fiona>=1.9             # GDB 图层枚举 (geopandas 后端)
+pyproj>=3.4            # CRS 处理
+scipy>=1.9             # M2 ndimage 连通分析 / uniform_filter
