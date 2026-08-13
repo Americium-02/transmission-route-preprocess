@@ -65,12 +65,9 @@ preprocess/
 ├── config/
 │   ├── default_feature_rules.json     # 65 条地物规则基础库
 │   └── wind_ice_cost_table.json       # 风区×冰区组合代价表
-├── tests/                             # 见 §十一
-├── docs/                              # 历史设计文档（部分已过时，以本 README 为准）
 ├── data/control/start_end.geojson     # 示例起终点
 ├── requirements.txt
-├── README.md                          # 本文件
-└── CHANGELOG*.md                      # 各版本变更记录
+└── README.md                          # 本文件
 ```
 
 ---
