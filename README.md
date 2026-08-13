@@ -1,8 +1,9 @@
 # preprocess — 输电线路路径规划 · 预处理端 (M0–M3)
 
-> **版本：v0.6.5**（2026-08）
+> **版本：v0.7.4**（2026-08）
 > 把原始 GIS 数据（GDB / SHP / DEM 栅格）转换为算法端可直接消费的标准化中间产物。
 >
+> **本 README 对应当前代码实际行为**，替代此前 v0.1 时期的旧版。若本文与 `docs/` 下的历史设计文档冲突，**以本文为准**。
 
 ---
 
@@ -18,7 +19,9 @@
 8. [产出文件说明（输出）](#八产出文件说明输出)
 9. [与算法端的对接契约](#九与算法端的对接契约)
 10. [核心算法要点](#十核心算法要点)
-111. [常见问题](#十一常见问题)
+11. [测试](#十一测试)
+12. [常见问题](#十二常见问题)
+13. [版本历史](#十三版本历史)
 
 ---
 
@@ -100,12 +103,15 @@ conda install -c conda-forge geopandas rasterio fiona pyproj shapely gdal numpy 
 
 ```bash
 # 1) 标准运行（生产用，喂算法端）
-python run_preprocess.py --project_dir data --output_dir ./output
+python run_preprocess.py --project_dir data_subset_1 --output_dir ./output
 
 # 2) 调试运行（额外产出中间栅格供 QGIS 查看）
-python run_preprocess.py --project_dir data --output_dir ./output \
+python run_preprocess.py --project_dir data_subset_1 --output_dir ./output \
                          --emit_unconsumed_outputs
 
+# 3) 精细塔位阶段（产出细分辨率栅格）
+python run_preprocess.py --project_dir data_subset_1 --output_dir ./output \
+                         --enable_fine_resolution
 ```
 
 每次运行生成带时间戳的独立目录 `output/run_YYYYMMDD_HHMMSS/`，历史结果不会被覆盖。
@@ -123,11 +129,11 @@ python tests/smoke_test.py                  # 静态冒烟（不依赖 GIS 运�
 ## 五、工程数据目录约定（输入）
 
 ```
-data/                              ← --project_dir 指向这里
+data_subset_1/                              ← --project_dir 指向这里
 ├── project.json                            ← 工程配置（见 §六）
 ├── 大埔工程地物数据/
 │   └── 梅江区梅县区大埔县敏感点数据.gdb/       ← 地物 GDB
-├── 大埔工程地形数据/
+├── 大埔工程地形数据_0717/
 │   └── ....gdb/地形地貌/山谷                  ← 地形 GDB（山谷等）
 ├── dem/                                    ← DEM 栅格
 ├── wind_ice/                               ← 风区/覆冰区矢量（GDB）
@@ -411,7 +417,24 @@ output/run_20260812_205127/
 
 不用中轴线（骨架）法的原因：真实岸线锯齿会让骨架长出大量伪分叉，在宽河段与汇流口退化成乱线，本项目实测无法收敛。弦中点法则因两岸锯齿方向相反、取中点相互抵消而天然稳健，且每个河段**只输出一条线**。
 
-**端部处理**（v0.6.5）：布站两端各内缩半站避免站点贴边；端部覆盖由**沿拟合圆弧外推 + 岸距守卫**补回 —— 守卫用「到河岸的距离」（按走向排除端边），因此朝切口推进不受影响、朝河岸漂移立刻停止。
+**求法（v0.7 起）：沿河道行走**，不再依赖全局主轴布站。
+
+早期版本沿连通块主轴每 100m 作垂线取弦中点。这在顺直/缓弯河道上可行，但在**细窄蜿蜒**河道上会出错：垂直于全局轴的截线一次横穿好几个河湾，且沿轴等距 ≠ 沿河道等距（蛇形河弧长可达轴长 1.5 倍以上），相邻站在河道上隔两三百米，连线直接横切河湾。实测密采样出河率达 11~29%。
+
+现改为局部行走：
+
+| 环节 | 做法 |
+|---|---|
+| 起点 | 河段**中部**（端部是端帽区，截面被端边剪断，行走会在里面打转） |
+| 起步方向 | 扫描 180° 取"垂直截面弦最短"者 = **局部**流向（蜿蜒河道中部的局部走向可能与全局主轴近乎垂直） |
+| 每一步 | 在当前切向 ±75° 扇形内搜索可行方向 → 取垂直于该方向、含该点的弦 → 中点为新的中心点 |
+| 步长 | **自适应** `clip(0.35×局部河宽, 4m, 0.5×interval)`；急弯处按上一步转角自动收步；落到面外则减半重试 |
+| 守卫 | 横移 > 0.6×局部河宽 → 停；无前进 → 停；贴近多步以前的位置 → 停（防打转）。严格守卫走不通时先就地放宽重试，避免局部锯齿让整段提前终止 |
+| 方向 | 从起点**正反两向**各走一遍再拼接 |
+
+**择优闸门**：两种方法失效模式互补（轴扫描不会提前停但会横切河湾；行走忠实跟随但可能提前停）。故按**面积法**估出河段应有长度（`面积 ÷ 平均河宽`，对锯齿岸线稳健，周长法会被锯齿放大 2 倍以上），行走覆盖不足 75% 时再跑一次轴扫描，取**有效长度**（扣掉落在河面外的部分）更大者。
+
+**端部处理**：布站不贴边；端点回折（钩子）与落在河面外的端点会被剪除。
 
 **分岔口**：一个河流面内有多条河道时，取弦可能在支流间切换，产生斜穿折返的假线。现已在跳变（> 2.5 站距）与折返（> 135°）处切开，各段内部走向一致；分段共用同一 `parent_feature_id`，算法端按 parent 去重，不重复计费。
 
@@ -439,28 +462,81 @@ output/run_20260812_205127/
 
 ---
 
-## 十一、常见问题
+## 十一、测试
+
+```bash
+# 河流相关（核心）
+python tests/test_river_centerline_coverage.py   # 基准线覆盖率/端部/分岔口切分/主轴（纯 numpy）
+python tests/test_river_centerline.py            # 基准线几何正确性
+python tests/test_river_split.py                 # 宽窄分治
+python tests/test_river_morphology.py            # 形态学开运算
+
+# 端到端与产物
+python tests/test_terrain_windice_e2e.py         # DEM/风冰端到端
+python tests/test_manifest.py                    # manifest 与交付级别
+python tests/test_area_m2.py                     # area_m2 注入
+python tests/test_rule_config_cost_fields.py     # 代价字段分解
+python tests/test_bbox_clip.py                   # bbox 裁剪
+python tests/test_resolution_gating.py           # 双档分辨率门控
+python tests/smoke_test.py                       # 静态冒烟（不依赖 GIS 运行时）
+```
+
+`test_river_centerline_coverage.py` 只依赖 numpy，可在无 GIS 环境下运行，适合改动 `geo_utils.py` 后快速回归。
+
+**辅助脚本**
+
+```bash
+python tests/inspect_real_inputs.py        # 检查真实输入数据结构
+python tests/inspect_wind_ice_vector.py    # 检查风冰矢量图层
+python tests/generate_test_data.py         # 生成模拟工程数据
+```
+
+---
+
+## 十二、常见问题
 
 **Q：写 GPKG 时报 `FieldError: Error adding field 'SHAPE_Area'`？**
 A：GeoPackage 字段名大小写不敏感，多源 SHP 合并常出现 `SHAPE_Area` / `Shape_Area` 并存。程序已内置去重兜底（加后缀保留源属性），日志会显示「解决 N 处字段名大小写冲突」，属正常。源头规避更稳妥：数据准备时避免仅大小写不同的重名字段。
+
+**Q：日志报 26 条规则要求保护范围但无对应变体？**
+A：`m0/protection_coverage_report.json` 列出明细。其中可能混着「本工程根本没有这类地物」（正常）与「有地物但缺保护范围」（需补数据）两类，需人工区分。
 
 **Q：交付级别为什么是 `PRELIMINARY_ROUTE_ONLY`？**
 A：见 §10.4。降级原因应**只有**风冰一项；若出现其他原因，说明有非预期问题。
 
 **Q：M2 为什么这么慢（约 200s，占总耗时 90%）？**
-A：主要在河流宽度分析（约 130s）与贴近奖励走廊（约 45s）。当前 M2 处理全量地图，而规划实际只用到工作区范围内 —— 裁剪优化在后续版本规划中。
+A：主要在河流宽度分析（约 130s）与贴近奖励走廊（约 45s）。v0.7 已把河流几何的两个热点函数向量化（单次调用由 ~100ms 降到 ~0.3ms）。当前 M2 处理全量地图，而规划实际只用到工作区范围内 —— 裁剪优化在后续版本规划中。
 
 **Q：DEM 太大跑不动？**
 A：确认 `solver_params.terrain_proc_resolution_floor_m` 已设（默认 10）。若能提供裁剪到工程周边的 DEM，可显著缩短处理时间。
+
+**Q：只有河流中心线、没有河流面要素，能跑吗？**
+A：宽窄分治依赖**面要素**。仅有中心线时无法判定宽度，会回退到简化处理。
 
 **Q：改了规则参数要重跑哪些模块？**
 A：当前规则表内置于 `config/`，改动后需重跑全流程（`rule_config.json` 是 M3 编译产物，但 M2 的几何分流也依赖规则）。规则库工程级可配置化在后续版本规划中。
 
 ---
 
+## 十三、版本历史
 
-## 后续规划
+| 版本 | 主要内容 |
+|---|---|
+| **v0.7.4** | 中心线改为**沿河道行走**（根治细窄蜿蜒河道横切河湾）；热点函数向量化（`_cs_chords` 370×、`_pip_raycast` 350×，河流分析 174s→~130s）；行走/轴扫描按有效长度择优；端点回折与面外端点剪除 |
+| v0.6.5 | 河流基准线端部：圆弧外推 + 岸距守卫；主轴改为**边长加权 PCA**（修近方形河块退化） |
+| v0.6.4 | 端部外推收口（弯道处不再甩到岸上） |
+| v0.6.3 | 端部站位内缩（修「端头拐向切口的角」）；分岔口斜穿折返切分 |
+| v0.6.2 | 修基准线成段断开、汇流口端头缺失、短河段无线；宽窄口径统一到形态学 |
+| v0.6.1 | 河流宽段改用形态学开运算（替代圆盘近似）；基准线改截面中点法；宽度口径修正 |
+| v0.6 | 八阶段改造 P0–P7 + 六项真实数据修复 + `working_crs` 自动选带 |
+| v0.5 | 变体分流、点对象不再自动 buffer、legacy 处理默认关闭 |
+| v0.1 | 从 `transmission_line_planning v5.7` 提取 |
 
+各版本详情见 `CHANGELOG*.md`。
+
+### 后续版本规划
+
+- 地形数据（山谷）接入 —— 本包无需改动，放入数据即生效
 - M2 处理范围裁剪到工作区
 - 保护范围 / 奖励范围自动生成
 - 规则库工程级可配置化（平台基础库 + 工程库）
@@ -468,4 +544,6 @@ A：当前规则表内置于 `config/`，改动后需重跑全流程（`rule_con
 
 ---
 
+## 十四、许可
 
+同原 `transmission_line_planning` 项目。
