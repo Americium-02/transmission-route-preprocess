@@ -343,24 +343,39 @@ def river_narrow_cross_segments(center_coords, widths, width_points,
 
 
 def _pip_raycast(pts, ext, holes):
-    """点是否在多边形(外环 ext + 洞 holes)内 (numpy 射线法, 无 shapely)。pts[N,2]→bool[N]。"""
+    """点是否在多边形(外环 ext + 洞 holes)内 (numpy 射线法, 无 shapely)。pts[N,2]→bool[N]。
+
+    ★A.8 (v0.7.0) 性能★ 原实现按环上的边**逐条 Python 循环**, 3201 顶点的河流面
+    单次调用耗时约 28ms。中心线改为"沿河道行走"后调用量增加一个数量级, 必须向量化。
+    现改为一次性对全部边做数组运算, 同量级输入下快约两个数量级。
+    """
     pts = np.atleast_2d(np.asarray(pts, dtype=float))
+    # ★A.8★ 分块: (N点 × M边) 矩阵在"几千点 × 上万顶点"时可达数百 MB, 会被 OOM 杀掉。
+    #   按点分批, 单批矩阵控制在千万元素以内。
+    n_edges = max(len(np.asarray(ext)), 1)
+    batch = max(1, min(len(pts), int(4_000_000 // max(n_edges, 1)) or 1))
+    if len(pts) > batch:
+        out = np.empty(len(pts), dtype=bool)
+        for i in range(0, len(pts), batch):
+            out[i:i + batch] = _pip_raycast(pts[i:i + batch], ext, holes)
+        return out
     x = pts[:, 0]
     y = pts[:, 1]
 
     def ring_test(ring):
-        ring = np.asarray(ring, dtype=float)
-        n = len(ring)
-        res = np.zeros(len(pts), dtype=bool)
-        j = n - 1
-        for i in range(n):
-            xi, yi = ring[i]
-            xj, yj = ring[j]
-            cond = ((yi > y) != (yj > y)) & (
-                x < (xj - xi) * (y - yi) / (yj - yi + 1e-18) + xi)
-            res ^= cond
-            j = i
-        return res
+        R = np.asarray(ring, dtype=float)
+        if len(R) < 3:
+            return np.zeros(len(pts), dtype=bool)
+        xi = R[:, 0]
+        yi = R[:, 1]
+        xj = np.roll(xi, 1)
+        yj = np.roll(yi, 1)
+        # (N, M): N 个点 × M 条边
+        cond_y = (yi[None, :] > y[:, None]) != (yj[None, :] > y[:, None])
+        denom = (yj - yi)[None, :]
+        denom = np.where(np.abs(denom) < 1e-18, 1e-18, denom)
+        xint = (xj - xi)[None, :] * (y[:, None] - yi[None, :]) / denom + xi[None, :]
+        return (cond_y & (x[:, None] < xint)).sum(axis=1) % 2 == 1
 
     inside = ring_test(ext)
     for h in (holes or []):
@@ -369,33 +384,42 @@ def _pip_raycast(pts, ext, holes):
 
 
 def _cs_chords(px, py, dx, dy, ext, holes):
-    """过点(px,py)沿方向(dx,dy)的直线与多边形的交, 配成'河内弦'。返回 [(ta,tb),...] (沿方向参数)。"""
+    """过点(px,py)沿方向(dx,dy)的直线与多边形的交, 配成'河内弦'。返回 [(ta,tb),...]。
+
+    ★A.8 (v0.7.0) 性能★ 同 _pip_raycast: 原按边逐条 Python 循环, 3201 顶点时
+    单次约 100ms; 现全部向量化, 并把"弦中点是否在河内"的判断合并成一次批量 PIP。
+    """
     p = np.array([px, py], dtype=float)
     d = np.array([dx, dy], dtype=float)
-    ts = []
+    ts_all = []
     for ring in [ext] + list(holes or []):
-        ring = np.asarray(ring, dtype=float)
-        n = len(ring)
-        for i in range(n):
-            a = ring[i]
-            b = ring[(i + 1) % n]
-            e = b - a
-            det = d[0] * (-e[1]) - (-e[0]) * d[1]
-            if abs(det) < 1e-12:
-                continue
-            rhs = a - p
-            t = (rhs[0] * (-e[1]) - (-e[0]) * rhs[1]) / det
-            s = (d[0] * rhs[1] - rhs[0] * d[1]) / det
-            if -1e-9 <= s <= 1 + 1e-9:
-                ts.append(t)
-    ts = sorted(ts)
-    chords = []
-    for k in range(len(ts) - 1):
-        tm = 0.5 * (ts[k] + ts[k + 1])
-        m = p + tm * d
-        if _pip_raycast(m[None, :], ext, holes)[0]:
-            chords.append((ts[k], ts[k + 1]))
-    return chords
+        R = np.asarray(ring, dtype=float)
+        if len(R) < 2:
+            continue
+        A = R
+        B = np.roll(R, -1, axis=0)
+        E = B - A                                   # (M,2) 边向量
+        det = d[0] * (-E[:, 1]) - (-E[:, 0]) * d[1]
+        ok = np.abs(det) >= 1e-12
+        if not ok.any():
+            continue
+        rhs = A - p                                 # (M,2)
+        det_ok = np.where(ok, det, 1.0)
+        t = (rhs[:, 0] * (-E[:, 1]) - (-E[:, 0]) * rhs[:, 1]) / det_ok
+        sv = (d[0] * rhs[:, 1] - rhs[:, 0] * d[1]) / det_ok
+        sel = ok & (sv >= -1e-9) & (sv <= 1 + 1e-9)
+        if sel.any():
+            ts_all.append(t[sel])
+    if not ts_all:
+        return []
+    ts = np.sort(np.concatenate(ts_all))
+    if len(ts) < 2:
+        return []
+    tm = 0.5 * (ts[:-1] + ts[1:])                   # 相邻交点的中点, 一次性批量判内外
+    mids = p[None, :] + tm[:, None] * d[None, :]
+    inside = _pip_raycast(mids, ext, holes)
+    idx = np.where(inside)[0]
+    return [(float(ts[k]), float(ts[k + 1])) for k in idx]
 
 
 def _cs_smooth(pts, k=2):
@@ -430,6 +454,306 @@ def _cs_tangents(pts):
     return d / (np.linalg.norm(d, axis=1, keepdims=True) + 1e-9)
 
 
+def _cs_axis(ext):
+    """边长加权 PCA 主轴 —— 只用于确定行走的**起点与初始方向**。
+
+    注意: 主轴是整个**连通块**的整体走向, 不是某一小段的方向。对蜿蜒河道,
+    它只能给出"这段河大体朝哪儿", 不能用来布站(见 _centerline_walk 说明)。
+    """
+    ext = np.asarray(ext, dtype=float)
+    seg_mid = 0.5 * (ext[:-1] + ext[1:])
+    seg_len = np.hypot(*(ext[1:] - ext[:-1]).T)
+    if seg_len.sum() > 1e-9 and len(seg_mid) >= 2:
+        wgt = seg_len / seg_len.sum()
+        c = (seg_mid * wgt[:, None]).sum(axis=0)
+        Xw = seg_mid - c
+        cov = (Xw * wgt[:, None]).T @ Xw
+    else:
+        c = ext.mean(axis=0)
+        Xw = ext - c
+        cov = Xw.T @ Xw
+    evals, V = np.linalg.eigh(cov)
+    ax = V[:, int(np.argmax(evals))]
+    proj = (ext - c) @ ax
+    return c, ax, float(proj.min()), float(proj.max())
+
+
+def _cs_boundary_distance(Q, ext, holes):
+    """点到多边形**边界**(外环+所有洞)的最短距离, 向量化。"""
+    Q = np.atleast_2d(np.asarray(Q, dtype=float))
+    best = np.full(len(Q), np.inf)
+    for ring in [ext] + list(holes or []):
+        R = np.asarray(ring, dtype=float)
+        if len(R) < 2:
+            continue
+        A = R[:-1]
+        B = R[1:]
+        AB = B - A
+        denom = np.einsum('ij,ij->i', AB, AB)
+        denom = np.where(denom < 1e-12, 1e-12, denom)
+        AP_x = Q[:, 0][:, None] - A[:, 0][None, :]
+        AP_y = Q[:, 1][:, None] - A[:, 1][None, :]
+        t = np.clip((AP_x * AB[:, 0][None, :] + AP_y * AB[:, 1][None, :]) / denom[None, :], 0.0, 1.0)
+        dx = AP_x - t * AB[:, 0][None, :]
+        dy = AP_y - t * AB[:, 1][None, :]
+        best = np.minimum(best, np.sqrt(dx * dx + dy * dy).min(axis=1))
+    return best
+
+
+def _cs_fit_arc(P):
+    """对末端若干点做最小二乘圆拟合(Kasa)。返回 (center, R, ok)。
+
+    用于让端部外推跟随河道弯势(仅全局轴扫描路径使用; 行走路径不做端部外推)。
+    """
+    P = np.asarray(P, dtype=float)
+    if len(P) < 3:
+        return None, np.inf, False
+    x = P[:, 0]
+    y = P[:, 1]
+    A = np.stack([2 * x, 2 * y, np.ones(len(P))], axis=1)
+    rhs = x * x + y * y
+    try:
+        sol, *_ = np.linalg.lstsq(A, rhs, rcond=None)
+    except Exception:
+        return None, np.inf, False
+    cx, cy, c = float(sol[0]), float(sol[1]), float(sol[2])
+    r2 = c + cx * cx + cy * cy
+    if not np.isfinite(r2) or r2 <= 0:
+        return None, np.inf, False
+    R = float(np.sqrt(r2))
+    if not np.isfinite(R) or R <= 0:
+        return None, np.inf, False
+    return np.array([cx, cy], dtype=float), R, True
+
+
+def _cs_effective_length(pts, ext, holes, k: int = 9):
+    """折线的**有效长度** = 各段长度 × 该段落在河面内的比例。
+
+    用于在"行走"与"轴扫描"两条路径间择优: 轴扫描常常靠横切河湾把线拉长,
+    单纯比长度会选错; 扣掉出河部分后, 横切的收益被抵消。
+    """
+    pts = np.asarray(pts, dtype=float)
+    if len(pts) < 2:
+        return 0.0
+    total = 0.0
+    ts = np.linspace(0.0, 1.0, k + 2)[1:-1]
+    for i in range(len(pts) - 1):
+        seg = pts[i + 1] - pts[i]
+        L = float(np.hypot(*seg))
+        if L <= 0:
+            continue
+        samp = pts[i][None, :] + ts[:, None] * seg[None, :]
+        total += L * float(_pip_raycast(samp, ext, holes).mean())
+    return total
+
+
+def _cs_reach_length_estimate(ext, holes, width_hint=0.0):
+    """估计河段应有的长度 = **面积 / 平均河宽**。
+
+    ★A.8.4★ 一定要用面积法, 不能用周长法。真实河岸是锯齿的, 周长被锯齿严重放大 ——
+    实测同一条河: 真实弧长 2578m, 周长法估出 5764m(失真 2.2 倍), 面积法 2572m(准确)。
+    面积对锯齿不敏感(正负噪声相互抵消), 这是它稳健的原因。
+    width_hint 传入实测河宽中位数; 缺省时退回按外接矩形短边估。
+    """
+    try:
+        ext = np.asarray(ext, dtype=float)
+
+        def _area(R):
+            R = np.asarray(R, dtype=float)
+            x, y = R[:, 0], R[:, 1]
+            return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+        A = _area(ext) - sum(_area(h) for h in (holes or []))
+        if A <= 0:
+            return 0.0
+        w = float(width_hint)
+        if not np.isfinite(w) or w <= 0:
+            c, ax, pmin, pmax = _cs_axis(ext)
+            span = max(pmax - pmin, 1e-6)
+            w = A / span
+        return A / max(w, 1e-6)
+    except Exception:
+        return 0.0
+
+
+def _centerline_walk(ext, holes, interval_m, max_steps: int = 6000,
+                     relaxed: bool = False):
+    """★A.8 (v0.7.0)★ **沿河道行走**求中心线, 取代原来的"全局轴扫描"。
+
+    为什么必须换掉全局轴扫描
+    ------------------------
+    原 pass0: 取连通块主轴, 沿**轴**每 interval 作垂线截河面取弦中点。
+    对顺直/缓弯河道没问题; 但对**细窄蜿蜒**河道:
+      · 垂直于全局轴的截线会一次横穿好几个河湾, "取最长弦"可能取到另一个湾;
+      · 沿轴等距 = 沿河道**不等距**, 相邻站在河道上可能隔了两三百米,
+        两点连线直接横切河湾。
+    实测(几何合法的蛇形夹具, 宽 25~60m): 密采样出河率 **11~29%**,
+    最大站距 144~187m(名义 100m) —— 与真实数据截图完全吻合。
+    3 轮局部精修救不回来, 因为初始线本身就横跨河湾。
+
+    本函数改为**局部行走**, 全程不依赖全局轴:
+      起点  : 主轴一端向内缩一点, 取垂直于主轴的弦中点(主轴只用来定起点与初始朝向)
+      每一步: 沿当前切向前进 step → 取垂直于切向、**含该点**的弦 → 中点即新的中心点
+              → 用最近两点更新切向
+      步长  : **自适应** step = clip(0.5×局部河宽, 5m, 0.5×interval)
+              细河步子小(跟得住弯), 宽河步子大(不浪费算力);
+              若前进后落到面外, 步长减半重试(最多 4 次)—— 弯道顶点自动收步。
+      守卫  : 重新定心的横移 > 0.6×局部宽 → 停(跳到别的湾);
+              前进量 <= 0.2×step → 停(折返)。
+      方向  : 从起点**正反两个方向**各走一遍再拼接, 因此起点落在河段中部也不丢覆盖。
+
+    返回 (pts[M,2], widths[M]); 走不动 → (空, 空), 由调用方回退老路径。
+    """
+    ext = np.asarray(ext, dtype=float)
+    holes = [np.asarray(h, dtype=float) for h in (holes or [])]
+
+    def chord_at(pt, tdir, pick_containing=True):
+        px, py = float(pt[0]), float(pt[1])
+        dx, dy = float(-tdir[1]), float(tdir[0])
+        ch = _cs_chords(px, py, dx, dy, ext, holes)
+        if not ch:
+            return None
+        if pick_containing:
+            a, b = min(ch, key=lambda z: abs(0.5 * (z[0] + z[1])))
+        else:
+            a, b = max(ch, key=lambda z: abs(z[1] - z[0]))
+        w = abs(b - a) * float(np.hypot(dx, dy))
+        m = np.array([px, py], dtype=float) + 0.5 * (a + b) * np.array([dx, dy])
+        return m, w
+
+    c, ax, pmin, pmax = _cs_axis(ext)
+    axis_len = pmax - pmin
+    if axis_len < 1e-6:
+        return np.empty((0, 2)), np.empty((0,))
+
+    # ── 起点: 从河段**中部**起步, 向两侧退让寻找可用位置 ──
+    #   ★不能取主轴极值端★: 那里是河段端帽, 垂直截面被端边剪短, 行走会在端帽内打转
+    #   (实测: 种子放 2% 处, 走 34 步全在端帽区兜圈, 宽度估计由 32m 退化到 12m)。
+    seed = None
+    for frac in (0.50, 0.42, 0.58, 0.34, 0.66, 0.25, 0.75, 0.15, 0.85):
+        cand = c + ax * (pmin + frac * axis_len)
+        r = chord_at(cand, ax, pick_containing=False)
+        if r is not None and _pip_raycast(r[0][None, :], ext, holes)[0]:
+            seed = r
+            break
+    if seed is None:
+        return np.empty((0, 2)), np.empty((0,))
+
+    # ── 起步方向: 取**局部**河道走向, 而不是全局主轴 ──
+    #   蜿蜒河道中部的局部走向可能与全局主轴接近垂直。做法: 扫描 180° 内的方向,
+    #   取"垂直于该方向的截面弦最短"者 —— 河宽是河道的最窄截面, 该方向即局部流向。
+    seed_pt = np.asarray(seed[0], dtype=float)
+    best_dir, best_w = ax, float("inf")
+    for a_deg in range(0, 180, 10):
+        a = np.radians(a_deg)
+        dv = np.array([np.cos(a), np.sin(a)])
+        rr = chord_at(seed_pt, dv, pick_containing=True)
+        if rr is not None and rr[1] < best_w:
+            best_w, best_dir = float(rr[1]), dv
+    if np.isfinite(best_w) and best_w > 0:
+        seed = (seed_pt, best_w)
+        ax_start = best_dir
+    else:
+        ax_start = ax
+
+    # 扇形候选方向: 优先直行, 走不通再逐级转向(急弯处必需)
+    _FAN = [0.0]
+    for _a in (4, 8, 13, 19, 26, 34, 43, 53, 64, 75):
+        _FAN.extend([np.radians(_a), -np.radians(_a)])
+
+    def walk(start_pt, start_w, t0):
+        """从起点沿一个方向走到底。
+
+        ★关键★ 每一步在 t 的 ±75° 扇形内搜索可行方向, 优先小转角。
+        只沿固定 t 前进(哪怕带平滑)在急弯处必然走出河面 —— 实测蛇形夹具
+        走 5 步(73m)就因 t 跟不上转弯而停; 扇形搜索后可走完全程。
+        """
+        pts = []
+        widths = []
+        P = np.asarray(start_pt, dtype=float)
+        t = np.asarray(t0, dtype=float)
+        nt = float(np.hypot(*t))
+        if nt < 1e-9:
+            return pts, widths
+        t = t / nt
+        w_cur = float(start_w) if start_w > 0 else float(interval_m)
+        shrink = 1.0        # 上一步转角大 → 本步收步(急弯自适应)
+        relax_run = 0       # 连续使用放宽守卫的步数
+        for _ in range(int(max_steps)):
+            # 步长必须显著小于局部曲率半径, 否则急弯处一步就跨到河外。
+            #   0.35×河宽 是实测折中: 再大在 R≈1.6×半宽 的急弯走不过去,
+            #   再小则步数(与耗时)线性上升。
+            step0 = float(np.clip(0.35 * w_cur * shrink, 4.0, 0.5 * float(interval_m)))
+            best = None
+            step = step0
+            n_relax = 0
+            for _shrink in range(6):
+                # ★A.8.3★ 每一步先按严格守卫找方向; 找不到再用放宽守卫**就地重试**,
+                #   而不是直接停。真实岸线在局部锯齿/窄颈处常让严格守卫全扇形失败,
+                #   一停就是整段少走几百米 —— 诊断实测 gap 中位数 222m, 而端部剔除
+                #   总共只削 0~240m, 说明缺口主要来自行走提前终止。
+                for _pass in (0, 1):
+                    lat_k = 0.6 if _pass == 0 else 1.2
+                    for ang in _FAN:
+                        ca, sa = float(np.cos(ang)), float(np.sin(ang))
+                        dirv = np.array([t[0] * ca - t[1] * sa, t[0] * sa + t[1] * ca])
+                        cand = P + dirv * step
+                        if not _pip_raycast(cand[None, :], ext, holes)[0]:
+                            continue
+                        r = chord_at(cand, dirv, pick_containing=True)
+                        if r is None:
+                            continue
+                        mm, ww = r
+                        if w_cur > 0 and float(np.hypot(*(mm - cand))) > lat_k * w_cur:
+                            continue
+                        if _pass == 0 and w_cur > 0 and ww > 3.0 * w_cur:
+                            continue
+                        if float(np.dot(mm - P, dirv)) <= 0.2 * step:
+                            continue
+                        if not _pip_raycast((0.5 * (P + mm))[None, :], ext, holes)[0]:
+                            continue
+                        best = (mm, ww, dirv)
+                        n_relax = _pass
+                        break
+                    if best is not None:
+                        break
+                if best is not None:
+                    break
+                step *= 0.5
+                if step < 2.0:
+                    break
+            if best is None:
+                break
+            m, w_new, dirv = best
+            # 防打转: 新点若贴近 6 步以前访问过的位置, 说明在端帽/环形区兜圈, 停。
+            if len(pts) > 6:
+                old_pts = np.asarray(pts[:-6])
+                if float(np.hypot(*(old_pts - m).T).min()) < 0.5 * max(w_cur, 5.0):
+                    break
+            pts.append(m)
+            widths.append(float(w_new))
+            adv = m - P
+            n2 = float(np.hypot(*adv))
+            if n2 > 1e-9:
+                newt = adv / n2
+                turn = abs(float(np.arctan2(t[0] * newt[1] - t[1] * newt[0],
+                                            t[0] * newt[0] + t[1] * newt[1])))
+                shrink = 0.5 if turn > np.radians(22) else min(1.0, shrink * 1.5)
+                t = newt                              # 直接采用实际前进方向
+            P = m
+            if w_new > 0:
+                w_cur = 0.5 * w_cur + 0.5 * w_new
+        return pts, widths
+
+    fwd_p, fwd_w = walk(seed[0], seed[1], ax_start)
+    bwd_p, bwd_w = walk(seed[0], seed[1], -ax_start)
+    pts = list(reversed(bwd_p)) + [np.asarray(seed[0], dtype=float)] + fwd_p
+    widths = list(reversed(bwd_w)) + [float(seed[1])] + fwd_w
+    if len(pts) < 2:
+        return np.empty((0, 2)), np.empty((0,))
+    return np.asarray(pts, dtype=float), np.asarray(widths, dtype=float)
+
+
 def _centerline_cross_section_core(ext, holes, interval_m, refine_iters=3):
     """★A.6-alt★ 截面中点法中心线 (纯 numpy; 绿线思路 + 局部切向精修修 S 弯'空洞')。
 
@@ -444,103 +768,538 @@ def _centerline_cross_section_core(ext, holes, interval_m, refine_iters=3):
     """
     ext = np.asarray(ext, dtype=float)
     holes = [np.asarray(h, dtype=float) for h in (holes or [])]
-    c = ext.mean(axis=0)
-    X = ext - c
-    _, V = np.linalg.eigh(X.T @ X)
-    ax = V[:, int(np.argmax(np.linalg.eigvalsh(X.T @ X)))]
-    proj = X @ ax
-    p1 = c + proj.min() * ax
-    p2 = c + proj.max() * ax
-    d = p2 - p1
-    L = float(np.hypot(*d))
-    if L < 1e-6:
-        return np.empty((0, 2)), np.empty((0,))
-    u = d / L
-    perp = np.array([-u[1], u[0]])
 
-    def mid_of(px, py, dirx, diry, pick=False):
-        ch = _cs_chords(px, py, dirx, diry, ext, holes)
-        if not ch:
-            return None
-        if pick:
-            a, b = min(ch, key=lambda c: abs(0.5 * (c[0] + c[1])))   # pick 点在截面 t≈0
+    # ★A.8 (v0.7.0)★ 首选"沿河道行走"(见 _centerline_walk):
+    #   可用环境变量 PREPROCESS_RIVER_WALK=0 关闭, 回退到旧的全局轴扫描路径,
+    #   便于在真实数据上 A/B 对比。
+    #   全局轴扫描在细窄蜿蜒河道上会横切河湾(实测出河率 11~29%), 行走法不依赖全局轴。
+    #   行走失败(极短块/异常形状)才回退到下面的全局轴扫描 + 局部精修。
+    _use_walk = os.environ.get('PREPROCESS_RIVER_WALK', '1') not in ('0', 'false', 'False')
+    walk_pts, walk_w = (_centerline_walk(ext, holes, interval_m)
+                        if _use_walk else (np.empty((0, 2)), np.empty((0,))))
+    if _use_walk and len(walk_pts) < 2:
+        # ★A.8.2★ 严格守卫在少数真实形态上会让行走在第一步就失败 → 整块退回全局轴扫描。
+        #   实测: A.8.1 收紧守卫后, 真实数据退化回退由 0 升到 10 个连通块(8.4%),
+        #   窄段 linear 由 2756 降到 2649, 且退回的旧路径带端部外推, 产生了
+        #   2.4% 的"端点落在河面外"。故先用放宽守卫再走一次, 尽量不回退。
+        walk_pts, walk_w = _centerline_walk(ext, holes, interval_m, relaxed=True)
+    # ── 覆盖率闸门: 行走走短了就退回全局轴扫描 ──
+    #   ★A.8.4★ 两种方法的失效模式是**互补**的:
+    #     · 全局轴扫描: 站位铺满整条主轴, **不会提前停**, 但在蜿蜒河道上横切河湾;
+    #     · 沿河道行走: 忠实跟随河道(细窄蜿蜒河的唯一正解), 但遇到局部锯齿/窄颈
+    #       可能提前停下, 整段少走几百米 —— 这正是"宽河 S 弯不如 A.7.1"的原因。
+    #   故按覆盖率择优: 用面积与周长按矩形模型估出河段应有长度 L_est,
+    #   行走长度不足 0.75×L_est 时, 再跑一次轴扫描, 取更长者。
+    #   这样宽缓河拿回轴扫描的连贯性, 细窄蜿蜒河保留行走的正确性。
+    def _axis_scan():
+        # ★A.7.4★ 主轴用**边长加权** PCA, 不用顶点计数 PCA。
+        #   顶点计数 PCA 对岸线顶点疏密敏感: 长边采样密、短边采样疏时, 方差被短边的
+        #   坐标值主导 → 近方形河块(如被两条道路夹出的 150×120m 块)会把主轴选到**横向**,
+        #   pass0 沿横向布站 → 站数不足 → 整块退化(实测 150m 块直接产 0 点)。
+        #   边长加权后主轴只取决于形状, 与顶点密度无关。
+        seg_mid = 0.5 * (ext[:-1] + ext[1:])
+        seg_len = np.hypot(*(ext[1:] - ext[:-1]).T)
+        if seg_len.sum() > 1e-9 and len(seg_mid) >= 2:
+            wgt = seg_len / seg_len.sum()
+            c = (seg_mid * wgt[:, None]).sum(axis=0)
+            Xw = seg_mid - c
+            cov = (Xw * wgt[:, None]).T @ Xw
         else:
-            a, b = max(ch, key=lambda c: abs(c[1] - c[0]))
-        # ★宽度口径 = **所选弦**的长度(=中心线所在这条河道的局部宽度), 不是"各弦总和"。
-        #   否则在 S 弯/回折处一条截线会穿河道多段, 总和被夸大(可达真河宽数倍) → 该处宽度被误判
-        #   ≥ 阈值 → river_narrow_cross_segments 把这些段当宽段丢弃 → S 弯出现"线段缺失"。
-        w = abs(b - a) * float(np.hypot(dirx, diry))
-        m = np.array([px, py], dtype=float) + 0.5 * (a + b) * np.array([dirx, diry])
-        return m, w
+            c = ext.mean(axis=0)
+            Xw = ext - c
+            cov = Xw.T @ Xw
+        evals, V = np.linalg.eigh(cov)
+        ax = V[:, int(np.argmax(evals))]
+        X = ext - c
+        proj = X @ ax
+        p1 = c + proj.min() * ax
+        p2 = c + proj.max() * ax
+        d = p2 - p1
+        L = float(np.hypot(*d))
+        if L < 1e-6:
+            return np.empty((0, 2)), np.empty((0,))
+        u = d / L
+        perp = np.array([-u[1], u[0]])
 
-    mids = []
-    dist = 0.0
-    while dist <= L:
-        p = p1 + u * dist
-        r = mid_of(p[0], p[1], perp[0], perp[1])
-        if r is not None:
-            mids.append(r[0])
-        dist += interval_m
-    if len(mids) < 2:
-        return np.empty((0, 2)), np.empty((0,))
-    mids = np.asarray(mids, dtype=float)
+        def mid_of(px, py, dirx, diry, pick=False):
+            ch = _cs_chords(px, py, dirx, diry, ext, holes)
+            if not ch:
+                return None
+            if pick:
+                a, b = min(ch, key=lambda c: abs(0.5 * (c[0] + c[1])))   # pick 点在截面 t≈0
+            else:
+                a, b = max(ch, key=lambda c: abs(c[1] - c[0]))
+            # ★宽度口径 = **所选弦**的长度(=中心线所在这条河道的局部宽度), 不是"各弦总和"。
+            #   否则在 S 弯/回折处一条截线会穿河道多段, 总和被夸大(可达真河宽数倍) → 该处宽度被误判
+            #   ≥ 阈值 → river_narrow_cross_segments 把这些段当宽段丢弃 → S 弯出现"线段缺失"。
+            w = abs(b - a) * float(np.hypot(dirx, diry))
+            m = np.array([px, py], dtype=float) + 0.5 * (a + b) * np.array([dirx, diry])
+            return m, w
 
-    for _ in range(int(refine_iters)):
-        guide = _cs_smooth(mids)
-        seg = np.hypot(*np.diff(guide, axis=0).T)
-        s = np.concatenate([[0.0], np.cumsum(seg)])
-        if s[-1] < 1e-6:
-            break
+        mids = []
+        # ★A.7.1 (v0.6.3)★ 站位从主轴两端各**内缩半个 interval**。
+        #   原来 dist 从 0 起、到 L 止, 首末站正好落在多边形沿主轴的极值处 = **边界上**。
+        #   站点贴边时, 垂直截面的射线会先从端边穿出、再到不了对岸 → 弦被端边截断,
+        #   弦中点因此失去意义并大幅偏移。实测直河末端: 站点 x=0.16(边界), 截得弦长 287m
+        #   (真值 500m), 中点被甩到 y=106.5; 该坏点再经 3 轮精修被逐步放大, 末端整段甩向岸边。
+        #   斜切端"拐向角落"与直河末端"甩出去"是同一个病。
+        #   内缩后端部覆盖由 _cs_extend_ends 用"切向直线 + 二分求边界"补回 —— 那条路径
+        #   不依赖截面, 对端边形状不敏感。
+        for inset in (min(0.5 * interval_m, 0.25 * L), 0.0):
+            # 短块(纵向 < 2×interval)内缩后可能凑不满 2 站 → 退回 inset=0 再试一次,
+            # 此时端部偏差由 _cs_trim_degenerate_ends 兜住。
+            mids = []
+            dist = inset
+            stop = L - inset
+            while dist <= stop + 1e-9:
+                p = p1 + u * dist
+                r = mid_of(p[0], p[1], perp[0], perp[1])
+                if r is not None:
+                    mids.append(r[0])
+                dist += interval_m
+            if len(mids) >= 2:
+                break
+        if len(mids) < 2:
+            return np.empty((0, 2)), np.empty((0,))
+        mids = np.asarray(mids, dtype=float)
+
+        for _ in range(int(refine_iters)):
+            guide = _cs_smooth(mids)
+            seg = np.hypot(*np.diff(guide, axis=0).T)
+            s = np.concatenate([[0.0], np.cumsum(seg)])
+            if s[-1] < 1e-6:
+                break
+            tang = _cs_tangents(guide)
+            new = []
+            # ★A.7★ 补末站: np.arange 不含终点, 末尾不足一个 interval 的一截会被丢,
+            #   叠加在每轮上又是一处系统性缩短。显式把弧长终点补进站位表。
+            stations = list(np.arange(0.0, s[-1], interval_m))
+            if (not stations) or (s[-1] - stations[-1] > 1e-6):
+                stations.append(float(s[-1]))
+            for st in stations:
+                i = min(max(int(np.searchsorted(s, st)), 1), len(guide) - 1)
+                f = (st - s[i - 1]) / max(s[i] - s[i - 1], 1e-9)
+                p = guide[i - 1] * (1 - f) + guide[i] * f
+                tg = tang[min(i, len(tang) - 1)]
+                pdir = np.array([-tg[1], tg[0]])
+                r = mid_of(p[0], p[1], pdir[0], pdir[1], pick=True)
+                if r is not None:
+                    new.append(r[0])
+            if len(new) < 2:
+                break
+            mids = np.asarray(new, dtype=float)
+
+        guide = mids
         tang = _cs_tangents(guide)
-        new = []
-        # ★A.7★ 补末站: np.arange 不含终点, 末尾不足一个 interval 的一截会被丢,
-        #   叠加在每轮上又是一处系统性缩短。显式把弧长终点补进站位表。
-        stations = list(np.arange(0.0, s[-1], interval_m))
-        if (not stations) or (s[-1] - stations[-1] > 1e-6):
-            stations.append(float(s[-1]))
-        for st in stations:
-            i = min(max(int(np.searchsorted(s, st)), 1), len(guide) - 1)
-            f = (st - s[i - 1]) / max(s[i] - s[i - 1], 1e-9)
-            p = guide[i - 1] * (1 - f) + guide[i] * f
-            tg = tang[min(i, len(tang) - 1)]
+        pts = []
+        widths = []
+        for k in range(len(guide)):
+            p = guide[k]
+            tg = tang[k]
             pdir = np.array([-tg[1], tg[0]])
             r = mid_of(p[0], p[1], pdir[0], pdir[1], pick=True)
             if r is not None:
-                new.append(r[0])
-        if len(new) < 2:
-            break
-        mids = np.asarray(new, dtype=float)
+                pts.append(r[0])
+                widths.append(r[1])
+        if len(pts) < 2:
+            return mids, np.zeros(len(mids))
+        pts = np.asarray(pts, dtype=float)
+        widths = np.asarray(widths, dtype=float)
 
-    guide = mids
-    tang = _cs_tangents(guide)
-    pts = []
-    widths = []
-    for k in range(len(guide)):
-        p = guide[k]
-        tg = tang[k]
-        pdir = np.array([-tg[1], tg[0]])
-        r = mid_of(p[0], p[1], pdir[0], pdir[1], pick=True)
-        if r is not None:
-            pts.append(r[0])
-            widths.append(r[1])
-    if len(pts) < 2:
-        return mids, np.zeros(len(mids))
-    widths = np.asarray(widths, dtype=float)
-    # 发卡/回折顶点处, 垂直于切向的截面会近乎"沿河道"→ 该点弦被拉长成孤立尖峰。
-    #   滚动中位数抹掉这类孤立尖峰(真正的宽段跨连续多点, 中位数会保留), 避免这些点被误判宽而丢段。
-    if len(widths) >= 3:
-        sm = widths.copy()
-        for i in range(len(widths)):
-            lo = max(0, i - 2)
-            hi = min(len(widths), i + 3)
-            sm[i] = float(np.median(widths[lo:hi]))
-        widths = sm
+        # ★A.7.1 (v0.6.3)★ 端头修复 —— 必须在滚动中位数之前做(否则退化宽度已被抹平)。
+        #   现象(真实数据): 河流面被道路/桥切成斜直边时, 中心线末端不指向端边中点,
+        #   而是**拐向端边的一个角**, 偏离真中心线可达半个河宽。
+        #   根因: pass0 的首/末站取自主轴极值 p1 = c + proj.min()*ax, 它落在多边形沿主轴
+        #   最远的**顶点**(斜切边的角)。该处垂线弦近乎退化(实测弦长仅全线中位的 0~23%),
+        #   弦中点就是那个角。A.7 之前非对称平滑把两端各削 ~400m, 恰好削掉了这个坏端点,
+        #   缺陷被掩盖; A.7 保端点后暴露。
+        #   修法: ①按**原始**弦宽剔除两端连续的退化站; ②再沿局部切向逐步外推、每步重新
+        #   定心, 直到出面 → 既去掉尖角伪点, 又把纵向覆盖补回真实端边。
+        pts, widths = _cs_trim_degenerate_ends(pts, widths)
+        pts, widths = _cs_extend_ends(pts, widths, ext, holes, interval_m, mid_of)
+        if len(pts) < 2:
+            return np.empty((0, 2)), np.empty((0,))
+
+        # 发卡/回折顶点处, 垂直于切向的截面会近乎"沿河道"→ 该点弦被拉长成孤立尖峰。
+        #   滚动中位数抹掉这类孤立尖峰(真正的宽段跨连续多点, 中位数会保留), 避免这些点被误判宽而丢段。
+        if len(widths) >= 3:
+            sm = widths.copy()
+            for i in range(len(widths)):
+                lo = max(0, i - 2)
+                hi = min(len(widths), i + 3)
+                sm[i] = float(np.median(widths[lo:hi]))
+            widths = sm
+        # ★A.7★ 折角补站: 保端点后, 发卡/回折顶点处相邻两站的**连线**可能抄近路切出河岸
+        #   (站点本身仍在河内)。算法端是拿这条折线做"跨越相交判定 + 交叉角", 连线出河
+        #   = 该处判定错位, 故在出河的相邻站之间插一站 (至多 2 轮, 单调收敛)。
+        pts, widths = _cs_densify_out_of_river(pts, widths, ext, holes)
+        return pts, widths
+    _wh = float(np.median(walk_w)) if len(walk_w) else 0.0
+    est_len = _cs_reach_length_estimate(ext, holes, _wh)
+    walk_res = None
+    if len(walk_pts) >= 2:
+        if len(walk_pts) >= 2:
+            pts, widths = walk_pts, walk_w
+            if len(widths) >= 3:
+                sm = widths.copy()
+                for i in range(len(widths)):
+                    sm[i] = float(np.median(widths[max(0, i - 2):min(len(widths), i + 3)]))
+                widths = sm
+            pts, widths = _cs_trim_degenerate_ends(pts, widths)
+            pts, widths = _cs_trim_end_hooks(pts, widths, interval_m)
+            pts, widths = _cs_drop_outside_ends(pts, widths, ext, holes)
+            # ★A.8★ 行走法**不做端部外推**: walk 本身就一路走到河道尽头(实测纵向覆盖
+            #   100%), 再沿切向外推 2×interval 只会冲出河心 —— 实测直河末端偏离
+            #   由 0 升到 212m(85% 半宽)。外推只属于旧的"全局轴扫描"路径(那条路的
+            #   端部会被剔除锥缩站削短, 需要补回)。
+            pts, widths = _cs_densify_out_of_river(pts, widths, ext, holes)
+            walk_res = (pts, widths)
+    if walk_res is not None:
+        w_len = float(np.hypot(*np.diff(walk_res[0], axis=0).T).sum()) if len(walk_res[0]) > 1 else 0.0
+        if est_len <= 0 or w_len >= 0.75 * est_len:
+            return walk_res
+        alt = _axis_scan()
+        if alt is not None and len(alt[0]) >= 2:
+            # ★A.8.4★ 比的是**有效长度**(扣掉落在河面外的部分), 不能只比长度 ——
+            #   轴扫描常靠横切河湾"变长", 单纯比长度会把蜿蜒河judged错。
+            a_len = _cs_effective_length(alt[0], ext, holes)
+            w_len = _cs_effective_length(walk_res[0], ext, holes)
+            if a_len > w_len:
+                logger.info(
+                    f"  河流中心线: 行走覆盖不足 ({w_len:.0f}m < 0.75×{est_len:.0f}m), "
+                    f"改用全局轴扫描 ({a_len:.0f}m)")
+                return alt
+        return walk_res
+    res = _axis_scan()
+    return res if res is not None else (np.empty((0, 2)), np.empty((0,)))
+
+def _cs_trim_end_hooks(pts, widths, interval_m, max_turn_deg: float = 100.0,
+                       max_trim_frac: float = 0.25):
+    """剪掉两端"往回弯折"的钩子。
+
+    ★A.8.2★ 真实数据现象(河道宽面端点细节.png): 线走到道路切口附近后,
+    最后一小段拐回来形成一个钩。成因是行走进入端帽区后, 扇形搜索(±75°)找到了
+    一个沿端帽横向的可行方向, 于是继续走 —— 走出来的就是钩。
+
+    判据: 以端部往内约 1 个 interval 的走向为基准, 若端点段与基准夹角 > max_turn_deg,
+    就把端点删掉, 逐点向内重复。只削端部, 不动中段。
+    """
     pts = np.asarray(pts, dtype=float)
-    # ★A.7★ 折角补站: 保端点后, 发卡/回折顶点处相邻两站的**连线**可能抄近路切出河岸
-    #   (站点本身仍在河内)。算法端是拿这条折线做"跨越相交判定 + 交叉角", 连线出河
-    #   = 该处判定错位, 故在出河的相邻站之间插一站 (至多 2 轮, 单调收敛)。
-    pts, widths = _cs_densify_out_of_river(pts, widths, ext, holes)
-    return pts, widths
+    widths = np.asarray(widths, dtype=float)
+    n = len(pts)
+    if n < 5:
+        return pts, widths
+    cap = max(1, int(n * max_trim_frac))
+    cos_lim = float(np.cos(np.radians(max_turn_deg)))
+
+    def _ref_dir(idx_list):
+        """idx_list: 由外向内的下标; 取跨约 1 个 interval 的内侧走向"""
+        acc = 0.0
+        j = 1
+        while j < len(idx_list) - 1 and acc < float(interval_m):
+            acc += float(np.hypot(*(pts[idx_list[j]] - pts[idx_list[j + 1]])))
+            j += 1
+        v = pts[idx_list[1]] - pts[idx_list[min(j, len(idx_list) - 1)]]
+        nv = float(np.hypot(*v))
+        return (v / nv) if nv > 1e-9 else None
+
+    lo, hi = 0, n - 1
+    for _ in range(cap):
+        idx = list(range(lo, hi + 1))
+        if len(idx) < 5:
+            break
+        ref = _ref_dir(idx)
+        if ref is None:
+            break
+        e = pts[idx[0]] - pts[idx[1]]
+        ne = float(np.hypot(*e))
+        if ne < 1e-9 or float(np.dot(e / ne, ref)) >= cos_lim:
+            break
+        lo += 1
+    for _ in range(cap):
+        idx = list(range(hi, lo - 1, -1))
+        if len(idx) < 5:
+            break
+        ref = _ref_dir(idx)
+        if ref is None:
+            break
+        e = pts[idx[0]] - pts[idx[1]]
+        ne = float(np.hypot(*e))
+        if ne < 1e-9 or float(np.dot(e / ne, ref)) >= cos_lim:
+            break
+        hi -= 1
+    if hi - lo + 1 < 2:
+        return pts, widths
+    return pts[lo:hi + 1], widths[lo:hi + 1]
+
+
+def _cs_drop_outside_ends(pts, widths, ext, holes):
+    """安全网: 删掉两端落在河面**外**的点。
+
+    ★A.8.2★ 诊断脚本实测有 2.4% 的端点 clearance < 0(在面外)。中心线的端点跑到
+    河面外没有任何合理解释, 一律删掉。中间点不动(极少数情况下窄颈处的数值抖动
+    不应导致整条线被拆断)。
+    """
+    pts = np.asarray(pts, dtype=float)
+    widths = np.asarray(widths, dtype=float)
+    n = len(pts)
+    if n < 2:
+        return pts, widths
+    inside = _pip_raycast(pts, ext, holes)
+    lo = 0
+    while lo < n - 1 and not inside[lo]:
+        lo += 1
+    hi = n - 1
+    while hi > lo and not inside[hi]:
+        hi -= 1
+    if hi - lo + 1 < 2:
+        return pts, widths
+    return pts[lo:hi + 1], widths[lo:hi + 1]
+
+
+def _cs_trim_degenerate_ends(pts, widths, taper_ratio: float = 0.70,
+                             max_trim_frac: float = 0.3):
+    """剔除两端"截面被端边剪断"的站。
+
+    ★A.8★ 判据改为**按弧长比较**, 而不是比相邻两站:
+      行走法的相邻点只隔 10~20m, 宽度比恒接近 1, 相邻比较完全失效 ——
+      端帽区(道路斜切出的横断边)里所有点的宽度都被剪短, 却一站也剔不掉,
+      结果线沿端帽横向走、端点被甩到一侧(实测直河末端偏离 213m = 85% 半宽)。
+      现改为: 把端点的宽度与"往内 1 个 interval 弧长处的宽度中位数"比,
+      低于 taper_ratio 即剔除。这样密集点与稀疏点两种输入都成立。
+    """
+    pts = np.asarray(pts, dtype=float)
+    widths = np.asarray(widths, dtype=float)
+    n = len(pts)
+    if n < 5:
+        return pts, widths
+    seg = np.hypot(*np.diff(pts, axis=0).T)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(cum[-1])
+    span = min(max(total * 0.25, 1.0), 200.0)      # 参考段弧长(不超过 1/4 全长)
+    cap = max(1, int(n * max_trim_frac))
+
+    def _inner_ref(i, forward):
+        if forward:
+            sel = (cum > cum[i]) & (cum <= cum[i] + span)
+        else:
+            sel = (cum < cum[i]) & (cum >= cum[i] - span)
+        vals = widths[sel]
+        vals = vals[vals > 0]
+        return float(np.median(vals)) if len(vals) else 0.0
+
+    lo = 0
+    while lo < cap and lo < n - 4:
+        ref = _inner_ref(lo, True)
+        if ref <= 0 or widths[lo] >= taper_ratio * ref:
+            break
+        lo += 1
+    hi = n - 1
+    cut = 0
+    while cut < cap and hi > lo + 3:
+        ref = _inner_ref(hi, False)
+        if ref <= 0 or widths[hi] >= taper_ratio * ref:
+            break
+        hi -= 1
+        cut += 1
+    if hi - lo + 1 < 2:
+        return pts, widths
+    return pts[lo:hi + 1], widths[lo:hi + 1]
+
+
+def _cs_split_zigzag(pts, widths, interval_m,
+                     jump_factor: float = 2.5, turn_deg: float = 135.0):
+    """把中心线在**跳变 / 大折返**处切开, 返回 [(pts_i, widths_i), ...]。
+
+    ★A.7.2★ 汇流口/分叉处一个河流面里有多条河道, 弦选取可能在支流间来回切换,
+    产生斜穿折返的假线。这些假线会被切成 50m 段带着**错误方位角**进
+    linear_cross_indexed, 而它们仍在河面内, 出河检测抓不到 —— 必须显式切开。
+
+    ★A.8.1 修正★ 判据必须**适配点间距**:
+      行走法输出的点间距只有 10~50m(全局轴扫描时是 100m)。沿用固定阈值后, 真实数据
+      分岔口切分数由 7 暴涨到 26, 表现为宽河 S 弯出现肉眼可见的断线。
+      现在:
+        · 跳变阈值 = max(2.5×interval, 3×**实际中位间距**);
+        · 大折角处先判断"折返幅度": 该点偏离前后两点连线的距离 < 0.6×局部河宽 时,
+          视为单点抖动 → **删掉该点**而不是切开(切开会白白制造一段缺口);
+          只有偏离显著(真的横穿到别的河道)才切。
+    """
+    pts = np.asarray(pts, dtype=float)
+    widths = np.asarray(widths, dtype=float)
+    n = len(pts)
+    if n < 2:
+        return []
+    seg = np.hypot(*np.diff(pts, axis=0).T)
+    med = float(np.median(seg)) if len(seg) else float(interval_m)
+    max_jump = max(float(jump_factor) * float(interval_m), 3.0 * med)
+
+    # ── 1) 先剔除"单点抖动": 大折角但偏离幅度小 ──
+    keep = np.ones(n, dtype=bool)
+    if n >= 3:
+        for i in range(1, n - 1):
+            a_, b_, c_ = pts[i - 1], pts[i], pts[i + 1]
+            v = c_ - a_
+            nv = float(np.hypot(*v))
+            if nv < 1e-9:
+                continue
+            u = v / nv
+            off = abs(float((b_ - a_)[0] * u[1] - (b_ - a_)[1] * u[0]))
+            d1 = b_ - a_
+            d2 = c_ - b_
+            n1, n2 = float(np.hypot(*d1)), float(np.hypot(*d2))
+            if n1 < 1e-9 or n2 < 1e-9:
+                continue
+            cosang = float(np.clip(np.dot(d1 / n1, d2 / n2), -1.0, 1.0))
+            if np.degrees(np.arccos(cosang)) > float(turn_deg):
+                w_loc = widths[i] if widths[i] > 0 else med
+                if off < 0.6 * w_loc and max(n1, n2) <= max_jump:
+                    keep[i] = False          # 小幅抖动 → 删点, 不切
+    pts = pts[keep]
+    widths = widths[keep]
+    n = len(pts)
+    if n < 2:
+        return []
+
+    # ── 2) 剩下的大跳变 / 大折返才切开 ──
+    seg = np.hypot(*np.diff(pts, axis=0).T)
+    cut = set(int(i) for i in np.where(seg > max_jump)[0])
+    if n >= 3:
+        d = np.diff(pts, axis=0)
+        d = d / (np.linalg.norm(d, axis=1, keepdims=True) + 1e-9)
+        turn = np.degrees(np.arccos(np.clip(np.sum(d[:-1] * d[1:], axis=1), -1.0, 1.0)))
+        for i in np.where(turn > float(turn_deg))[0]:
+            cut.add(int(i))
+            cut.add(int(i) + 1)
+    parts = []
+    start = 0
+    for i in range(n - 1):
+        if i in cut:
+            if i + 1 - start >= 2:
+                parts.append((pts[start:i + 1], widths[start:i + 1]))
+            start = i + 1
+    if n - start >= 2:
+        parts.append((pts[start:], widths[start:]))
+    return parts
+
+
+def _cs_extend_ends(pts, widths, ext, holes, interval_m, mid_of=None,
+                    max_extend_factor: float = 2.0,
+                    margin_m: float = 5.0,
+                    bank_floor_ratio: float = 0.15):
+    """两端补回纵向覆盖: **沿拟合圆弧推进到河岸边界**(二分求交)。
+
+    ★A.7.5 (v0.6.6)★ 本函数改了四版, 结论如下, 记录在案免得再走弯路:
+
+      · A.7.1「切向直线 + 二分到边界」
+          覆盖最好(真实数据窄段 linear 2359 条), 但直线在弯道处离开河心 ——
+          端点偏离达 70% 半宽, 表现为线头从岸边起再横折入河道(仅 1 处)。
+      · A.7.3「逐步再定心 + **截面**守卫」
+          偏移压到 16~20% 半宽, 但截面在端部本就被端边剪断, 守卫频繁早停 →
+          2359 → **2202**, 端头出现肉眼可见的断线。
+      · A.7.4「圆弧外推 + **岸距**守卫(按走向排除端边)」
+          合成算例覆盖大幅回升, 但真实数据 **2199**, 与 A.7.3 持平 ——
+          真实岸线锯齿使大量岸段方向散乱, 走向过滤失效, 守卫照样早停。
+          **合成夹具无法代表真实岸线, 这是这三轮反复的根因。**
+      · A.7.5(本版) 回到 A.7.1 的推进方式(二分到边界, 保住覆盖),
+          **只把"直线"换成"拟合圆弧"** —— 针对性修掉 A.7.1 唯一的失败模式(弯道漂移),
+          不再引入任何会提前终止的守卫; 仅保留一道极松的兜底(贴岸 < 15% 河宽才停),
+          正常情况下不会触发。
+    """
+    P = [np.asarray(q, dtype=float) for q in pts]
+    W = [float(w) for w in widths]
+    if len(P) < 2:
+        return np.asarray(P, dtype=float), np.asarray(W, dtype=float)
+    max_ext = float(interval_m) * float(max_extend_factor)
+
+    # ★A.8★ 参考段按**弧长**取(约 1 个 interval), 不能再按固定点数取:
+    #   行走法的点间距只有 10~20m, "最后 5 个点"仅跨 50~80m, 拟合圆弧的曲率噪声极大,
+    #   外推 200m 会直接飞出河道(实测端部偏离升至 90% 半宽)。
+    arr = np.asarray(P, dtype=float)
+    seglen = np.hypot(*np.diff(arr, axis=0).T) if len(arr) > 1 else np.array([0.0])
+    for side in (0, 1):
+        want = float(interval_m)
+        k = 2
+        acc = 0.0
+        while k < len(P) and acc < want:
+            acc += float(seglen[k - 2] if side == 0 else seglen[len(seglen) - (k - 1)])
+            k += 1
+        k = int(np.clip(k, 3, len(P)))
+        ref = [v for v in (W[:k] if side == 0 else W[-k:]) if v > 0]
+        w_ref = float(np.median(ref)) if ref else 0.0
+        tail = np.array(P[:k][::-1]) if side == 0 else np.array(P[-k:])
+        end_pt = tail[-1]
+        # ★A.8★ 方向取**整个参考段**的跨度, 不是最后两点之差 ——
+        #   行走法相邻点仅隔 10~20m, 单段差分的方向噪声在 200m 外推后被放大约 20 倍
+        #   (实测直河末端偏离 224m = 90% 半宽)。
+        tg = tail[-1] - tail[0]
+        nrm = float(np.hypot(*tg))
+        if nrm < 1e-9 and len(tail) >= 2:
+            tg = tail[-1] - tail[-2]
+            nrm = float(np.hypot(*tg))
+        if nrm < 1e-9:
+            continue
+        tg = tg / nrm
+
+        center, R, ok = _cs_fit_arc(tail)
+        use_arc = bool(ok and np.isfinite(R) and R > max(2.0 * w_ref, 1.0) and R < 1e7)
+        if use_arc:
+            rad = end_pt - center
+            rr = float(np.hypot(*rad))
+            if rr < 1e-9:
+                use_arc = False
+            else:
+                sgn = 1.0 if float(rad[0] * tg[1] - rad[1] * tg[0]) > 0 else -1.0
+                th0 = float(np.arctan2(rad[1], rad[0]))
+
+        def _at(dist):
+            if use_arc:
+                dth = sgn * dist / R
+                return center + rr * np.array([np.cos(th0 + dth), np.sin(th0 + dth)])
+            return end_pt + tg * dist
+
+        def _acceptable(q):
+            if not _pip_raycast(q[None, :], ext, holes)[0]:
+                return False
+            # 极松兜底: 只在明显贴岸时否决(正常外推不会触发)。
+            #   绝对上限 25m —— 否则宽河(如 500m)的比例阈值会让外推在离切口 75m 处
+            #   就停下, 又变成肉眼可见的断线。
+            if w_ref > 0:
+                floor = min(bank_floor_ratio * w_ref, 25.0)
+                if float(_cs_boundary_distance(q[None, :], ext, holes)[0]) < floor:
+                    return False
+            return True
+
+        # 二分求出沿弧线仍可接受的最远距离(与 A.7.1 同一策略, 保住覆盖)
+        lo_d, hi_d = 0.0, max_ext
+        if _acceptable(_at(hi_d)):
+            lo_d = hi_d
+        else:
+            for _ in range(24):
+                mid_d = 0.5 * (lo_d + hi_d)
+                if _acceptable(_at(mid_d)):
+                    lo_d = mid_d
+                else:
+                    hi_d = mid_d
+        d_use = lo_d - float(margin_m)
+        if d_use <= float(interval_m) * 0.2:
+            continue
+        q_end = _at(d_use)
+        if not _pip_raycast(q_end[None, :], ext, holes)[0]:
+            continue
+        # 弧长较长时补一个中间点, 保证折线贴合弧线
+        cands = [_at(0.5 * d_use), q_end] if d_use > float(interval_m) * 0.8 else [q_end]
+        prev = end_pt
+        for q in cands:
+            if not _pip_raycast((0.5 * (prev + q))[None, :], ext, holes)[0]:
+                break
+            if side == 0:
+                P.insert(0, q)
+                W.insert(0, w_ref if w_ref > 0 else W[0])
+            else:
+                P.append(q)
+                W.append(w_ref if w_ref > 0 else W[-1])
+            prev = q
+    return np.asarray(P, dtype=float), np.asarray(W, dtype=float)
 
 
 def _cs_densify_out_of_river(pts, widths, ext, holes, max_rounds: int = 2):
@@ -591,7 +1350,8 @@ def _cs_densify_out_of_river(pts, widths, ext, holes, max_rounds: int = 2):
     return np.asarray(P, dtype=float), np.asarray(W, dtype=float)
 
 
-def river_polygon_centerline(polygon, interval_m: float = 100.0, refine_iters: int = 3):
+def river_polygon_centerline(polygon, interval_m: float = 100.0, refine_iters: int = 3,
+                             return_parts: bool = False):
     """
     ★P7 (v0.6) + A.6-alt★ 从河流**面**提取中心线 + 逐站宽度。
 
@@ -600,14 +1360,20 @@ def river_polygon_centerline(polygon, interval_m: float = 100.0, refine_iters: i
       - **局部切向精修**修正强 S 弯/宽弯处"一条全局垂线截错段"的跳变/出河(pre-A.6 的 R10 空洞);
       - 始终**单条线**、对岸线锯齿不敏感 → 不产生中轴线那样的乱线/闭合环。
 
-    返回: (widths[float], width_points[shapely Point], center_line[LineString])。
-      - 面为空 → ([], [], None); 退化(核心产不出≥2点) → center_line 退回最小外接矩形长轴。
+    返回:
+      - return_parts=False (默认, 向后兼容): (widths, width_points, center_line) 单条,
+        多段时取**最长**的一段;
+      - return_parts=True: [(widths, width_points, line), ...] 全部分段。
+      面为空 → ([], [], None) / []; 退化(核心产不出≥2点) → 回退最小外接矩形长轴。
 
     refine_iters: 局部切向精修迭代次数(默认 3; 0 = 仅初始全局垂线中点, 等价旧绿线)。
+
+    ★A.7.2★ 汇流口/分叉处中心线可能在支流间斜穿折返, 由 _cs_split_zigzag 切开成多段
+    (见该函数说明)。分段共用同一 parent_feature_id, 算法端按 parent 去重, 不重复计费。
     """
     from shapely.geometry import LineString as LS, Point as Pt
     if polygon is None or getattr(polygon, "is_empty", True):
-        return [], [], None
+        return [] if return_parts else ([], [], None)
     # ── 优先: numpy 截面中点核心(含局部切向精修) ──
     ext = None
     holes = []
@@ -622,9 +1388,18 @@ def river_polygon_centerline(polygon, interval_m: float = 100.0, refine_iters: i
         except Exception:
             pts, widths = np.empty((0, 2)), np.empty((0,))
         if len(pts) >= 2:
-            center_line = LS([(float(x), float(y)) for x, y in pts])
-            width_points = [Pt(float(x), float(y)) for x, y in pts]
-            return [float(w) for w in widths], width_points, center_line
+            parts = _cs_split_zigzag(pts, widths, interval_m) or [(pts, widths)]
+            packed = []
+            for ppts, pw in parts:
+                packed.append((
+                    [float(w) for w in pw],
+                    [Pt(float(x), float(y)) for x, y in ppts],
+                    LS([(float(x), float(y)) for x, y in ppts]),
+                ))
+            if return_parts:
+                return packed
+            # 兼容口径: 取最长的一段
+            return max(packed, key=lambda t: t[2].length)
     # ── 退化回退: 最小外接矩形长轴(保证非空) ──
     # ★A.7 (v0.6.2)★ 原实现回退时返回 widths=[] / width_points=[] →
     #   下游 river_narrow_cross_segments 的守卫 `if ... or not width_points: return []`
@@ -642,9 +1417,11 @@ def river_polygon_centerline(polygon, interval_m: float = 100.0, refine_iters: i
         axis = LS([p1, p2])
         widths, width_points = _axis_station_widths(
             polygon, p1, p2, axis_len, interval_m)
+        if return_parts:
+            return [(widths, width_points, axis)]
         return widths, width_points, axis
     except Exception:
-        return [], [], None
+        return [] if return_parts else ([], [], None)
 
 
 def _axis_station_widths(polygon, p1, p2, axis_len, interval_m):
