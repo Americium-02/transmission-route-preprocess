@@ -649,6 +649,7 @@ class M2GeometryPreprocessor:
         n_narrow_seg = 0        # 窄河 linear 段数 (real_barrier 路径)
         n_axis_fallback = 0     # ★A.7★ 中心线退化回退 MABR 直轴的连通块数 (审计)
         n_narrow_comp = 0       # ★A.7★ 窄段连通块总数 (审计, 配合上者看回退率)
+        n_centerline_split = 0  # ★A.7.2★ 中心线因跳变/折返被切成多段的连通块数 (≈分岔口数)
         for idx, row in river_polys.iterrows():
             geom = row.geometry
             l2 = row.get("std_level2", "非通航河流")
@@ -690,49 +691,58 @@ class M2GeometryPreprocessor:
                     for ci, comp in enumerate(narrow_polys):
                         n_narrow_comp += 1
                         try:
-                            w_c, wp_c, cl_c = self._compute_river_widths(
-                                comp, interval_m=100)
+                            # ★A.7.2 (v0.6.3)★ return_parts=True: 汇流口/分叉处中心线
+                            #   在支流间斜穿折返的部分已被切开, 逐段处理。斜穿段若不切开,
+                            #   会带着错误方位角进 linear_cross → 算法端跨越判定/交叉角错位;
+                            #   且它仍在河面内, 出河检测抓不到 (见 geo_utils._cs_split_zigzag)。
+                            parts = self._compute_river_widths(
+                                comp, interval_m=100, return_parts=True)
                         except Exception as e:
                             logger.warning(f"窄段中心线计算失败: {e}")
                             continue
-                        if cl_c is None:
+                        if not parts:
                             continue
-                        # ★A.7 (v0.6.2)★ 退化回退计数 (核心产不出中心线 → 走 MABR 直轴):
-                        #   回退本身不再丢段(geo_utils 已补逐站宽度), 但回退率高说明
-                        #   河流面被切得过碎, 值得在日志里可见。
-                        if len(list(cl_c.coords)) <= 2:
-                            n_axis_fallback += 1
-                        # ★A.7★ width_filter=False: 宽窄已由 A2 形态学开运算判定
-                        #   (narrow = river − wide), 此处不再按逐站宽度二次过滤,
-                        #   否则汇流口/展宽处宽度被抬高 → 段被误丢 → 中心线断开。
-                        segs = river_narrow_cross_segments(
-                            list(cl_c.coords), w_c, wp_c,
-                            threshold_m, seg_length_m=50.0,
-                            width_filter=False)
-                        for si, (seg_geom, az) in enumerate(segs):
-                            self.linear_cross_segments.append({
-                                "segment_id": f"river_{idx}_{ci}_{si}",
-                                "parent_feature_id": f"river_feat_{idx}",
-                                "level1": rlevel1, "level2": l2,
-                                "rule_id": rid,
-                                "azimuth_deg": round(az, 2),
-                                "min_cross_angle_deg": min_angle,  # 通航 45 / 非通航 None
-                                "cross_cost": base_cc, "cost_type": cost_type,
-                                "cross_cost_formula": cross_formula,
-                                "buffer_dist_m": 0,  # 河本体面已表达范围, 线段不再 buffer
-                                "geometry": seg_geom,
-                            })
-                            n_narrow_seg += 1
-                            crossing_windows.append({   # 审计窗口 = 窄段中点
-                                "window_id": f"rw_{idx}_{ci}_{si}",
-                                "river_name": row.get("name", ""),
-                                "is_navigable": is_navigable,
-                                "width_m": None,
-                                "azimuth_deg": round(az, 1),
-                                "min_cross_angle_deg": min_angle,
-                                "cross_cost": base_cc,
-                                "geometry": seg_geom.interpolate(0.5, normalized=True),
-                            })
+                        if len(parts) > 1:
+                            n_centerline_split += 1
+                        for pi, (w_c, wp_c, cl_c) in enumerate(parts):
+                            if cl_c is None:
+                                continue
+                            # ★A.7 (v0.6.2)★ 退化回退计数 (核心产不出中心线 → 走 MABR 直轴):
+                            #   回退本身不再丢段(geo_utils 已补逐站宽度), 但回退率高说明
+                            #   河流面被切得过碎, 值得在日志里可见。
+                            if pi == 0 and len(parts) == 1 and len(list(cl_c.coords)) <= 2:
+                                n_axis_fallback += 1
+                            # ★A.7★ width_filter=False: 宽窄已由 A2 形态学开运算判定
+                            #   (narrow = river − wide), 此处不再按逐站宽度二次过滤,
+                            #   否则汇流口/展宽处宽度被抬高 → 段被误丢 → 中心线断开。
+                            segs = river_narrow_cross_segments(
+                                list(cl_c.coords), w_c, wp_c,
+                                threshold_m, seg_length_m=50.0,
+                                width_filter=False)
+                            for si, (seg_geom, az) in enumerate(segs):
+                                self.linear_cross_segments.append({
+                                    "segment_id": f"river_{idx}_{ci}_{pi}_{si}",
+                                    "parent_feature_id": f"river_feat_{idx}",
+                                    "level1": rlevel1, "level2": l2,
+                                    "rule_id": rid,
+                                    "azimuth_deg": round(az, 2),
+                                    "min_cross_angle_deg": min_angle,  # 通航 45 / 非通航 None
+                                    "cross_cost": base_cc, "cost_type": cost_type,
+                                    "cross_cost_formula": cross_formula,
+                                    "buffer_dist_m": 0,  # 河本体面已表达范围, 线段不再 buffer
+                                    "geometry": seg_geom,
+                                })
+                                n_narrow_seg += 1
+                                crossing_windows.append({   # 审计窗口 = 窄段中点
+                                    "window_id": f"rw_{idx}_{ci}_{pi}_{si}",
+                                    "river_name": row.get("name", ""),
+                                    "is_navigable": is_navigable,
+                                    "width_m": None,
+                                    "azimuth_deg": round(az, 1),
+                                    "min_cross_angle_deg": min_angle,
+                                    "cross_cost": base_cc,
+                                    "geometry": seg_geom.interpolate(0.5, normalized=True),
+                                })
             else:
                 # ── v0.5 回退 (enable_river_real_barrier=False): 圆盘法, 圆盘直接进 forbidden ──
                 try:
@@ -785,17 +795,23 @@ class M2GeometryPreprocessor:
         # ★A.7★ 中心线质量审计: 回退率高 = 河流面被切得碎 / 参数需调
         self.preprocessing_report["river_narrow_component_count"] = n_narrow_comp
         self.preprocessing_report["river_centerline_axis_fallback_count"] = n_axis_fallback
+        self.preprocessing_report["river_centerline_split_component_count"] = n_centerline_split
         if n_narrow_comp:
             logger.info(
                 f"  河流中心线: 窄段连通块 {n_narrow_comp} 个, "
                 f"其中退化回退直轴 {n_axis_fallback} 个 "
-                f"({100.0 * n_axis_fallback / n_narrow_comp:.1f}%); "
+                f"({100.0 * n_axis_fallback / n_narrow_comp:.1f}%), "
+                f"分岔口切分 {n_centerline_split} 个 "
+                f"({100.0 * n_centerline_split / n_narrow_comp:.1f}%); "
                 f"窄段 linear 段 {n_narrow_seg} 条")
 
-    def _compute_river_widths(self, polygon, interval_m=100):
+    def _compute_river_widths(self, polygon, interval_m=100, return_parts=False):
         # ★P7 (v0.6)★ 委托 geo_utils.river_polygon_centerline:
         #   中心线点改用"垂直交线中点"(跟随河道横向摆动, 缓解 R10), 宽度口径不变。
-        return river_polygon_centerline(polygon, interval_m=interval_m)
+        # ★A.7.2★ return_parts=True → 返回 [(widths, width_points, line), ...],
+        #   汇流口斜穿折返处已切开; False → 单条(取最长), 兼容 v0.5 回退路径。
+        return river_polygon_centerline(polygon, interval_m=interval_m,
+                                        return_parts=return_parts)
 
     def _estimate_river_azimuth(self, river_poly, point) -> float:
         rect = river_poly.minimum_rotated_rectangle
